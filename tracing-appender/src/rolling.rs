@@ -32,9 +32,44 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
 };
+use thiserror::Error;
 use time::{format_description, Date, Duration, OffsetDateTime, PrimitiveDateTime, Time};
+use time_tz::{OffsetDateTimeExt, Tz};
+
+static TZ: OnceLock<&Tz> = OnceLock::new();
+
+/// 设置滚动日志时区时可能返回的错误。
+///
+/// 该错误表示滚动日志使用的时区已被初始化，
+/// 因此无法再次设置。
+#[derive(Debug, Error)]
+#[error("timezone has already been set")]
+pub struct SetTzError;
+
+/// 设置滚动日志使用的时区。
+///
+/// 该时区将用于计算日志滚动的时间边界以及生成日志文件名。
+/// 必须在创建任何 [`RollingFileAppender`] 之前调用，且只能设置一次。
+pub fn set_tz(tz: &'static Tz) -> Result<(), SetTzError> {
+    TZ.set(tz).map_err(|_| SetTzError)
+}
+
+/// 返回用于生成滚动日志文件名时间戳的时区。
+///
+/// # Panics
+///
+/// 如果在创建 [`RollingFileAppender`] 之前未调用 [`set_tz`]。
+#[inline]
+pub(crate) fn tz() -> &'static Tz {
+    TZ.get().expect(
+        "global timezone not initialized; call set_tz() before creating a RollingFileAppender",
+    )
+}
 
 mod builder;
 pub use builder::{Builder, InitError};
@@ -192,7 +227,8 @@ impl RollingFileAppender {
             ref max_files,
         } = builder;
         let directory = directory.as_ref().to_path_buf();
-        let now = OffsetDateTime::now_utc();
+        // let now = OffsetDateTime::now_utc();
+        let now = OffsetDateTime::now_utc().to_timezone(tz());
         let (state, writer) = Inner::new(
             now,
             rotation.clone(),
@@ -215,7 +251,8 @@ impl RollingFileAppender {
         return (self.now)();
 
         #[cfg(not(test))]
-        OffsetDateTime::now_utc()
+        // OffsetDateTime::now_utc()
+        OffsetDateTime::now_utc().to_timezone(tz())
     }
 }
 
@@ -555,10 +592,18 @@ impl Rotation {
 
     fn date_format(&self) -> Vec<format_description::FormatItem<'static>> {
         match *self {
-            Rotation::MINUTELY => format_description::parse("[year]-[month]-[day]-[hour]-[minute]"),
-            Rotation::HOURLY => format_description::parse("[year]-[month]-[day]-[hour]"),
-            Rotation::DAILY => format_description::parse("[year]-[month]-[day]"),
-            Rotation::WEEKLY => format_description::parse("[year]-[month]-[day]"),
+            Rotation::MINUTELY => format_description::parse(
+                "[year]-[month]-[day]-[hour]-[minute][offset_hour sign:mandatory][offset_minute]",
+            ),
+            Rotation::HOURLY => format_description::parse(
+                "[year]-[month]-[day]-[hour][offset_hour sign:mandatory][offset_minute]",
+            ),
+            Rotation::DAILY => format_description::parse(
+                "[year]-[month]-[day][offset_hour sign:mandatory][offset_minute]",
+            ),
+            Rotation::WEEKLY => format_description::parse(
+                "[year]-[month]-[day][offset_hour sign:mandatory][offset_minute]",
+            ),
             Rotation::NEVER => format_description::parse("[year]-[month]-[day]"),
         }
         .expect("Unable to create a formatter; this is a bug in tracing-appender")
